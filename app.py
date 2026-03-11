@@ -21,8 +21,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
-MAX_CHARS = int(os.environ.get("MAX_CHARS", "12000"))  # Ollama-Kontextlimit
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # 7b: ~2x schneller auf CPU, für Anonymisierung ausreichend
+MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))  # Reduziert für schnellere Verarbeitung (~5-8 Min statt 24)
 
 SYSTEM_PROMPT = """\
 Du bist ein DSGVO-Anonymisierungs-Assistent. Anonymisiere personenbezogene Daten \
@@ -57,6 +57,7 @@ def call_ollama(text: str) -> str:
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "stream": False,
+        "keep_alive": "10m",  # Modell bleibt warm für Folgeanfragen
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Anonymisiere folgenden Text DSGVO-konform:\n\n{text}"},
@@ -69,7 +70,7 @@ def call_ollama(text: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:  # 10 Min Timeout für lange Texte
         data = json.loads(resp.read())
     return data["message"]["content"]
 
@@ -113,7 +114,7 @@ def build_pdf(anon_text: str, mapping: str) -> bytes:
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, "DSGVO-anonymisiertes Dokument", ln=True)
     pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 6, "Erstellt mit DSGVO Anonymizer (Ollama / qwen2.5:14b)", ln=True)
+    pdf.cell(0, 6, "Erstellt mit DSGVO Anonymizer (Ollama / qwen2.5:7b)", ln=True)
     pdf.cell(0, 6, "Hinweis: Umlaute wurden fuer PDF-Kompatibilitaet ersetzt (ae/oe/ue)", ln=True)
     pdf.ln(4)
 

@@ -12,6 +12,7 @@ import os
 import re
 import textwrap
 import urllib.request
+from typing import Any
 
 import pdfplumber
 from flask import Flask, jsonify, request, send_file
@@ -20,9 +21,10 @@ from fpdf import FPDF
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://172.28.0.20:11434")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # 7b: ~2x schneller auf CPU, für Anonymisierung ausreichend
-MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))  # Reduziert für schnellere Verarbeitung (~5-8 Min statt 24)
+MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))
+INCLUDE_MAPPING_IN_PDF = os.environ.get("INCLUDE_MAPPING_IN_PDF", "").lower() in {"1", "true", "yes"}
 
 SYSTEM_PROMPT = """\
 Du bist ein DSGVO-Anonymisierungs-Assistent. Anonymisiere personenbezogene Daten \
@@ -45,15 +47,73 @@ Behalte IMMER bei:
 - Beträge und Zahlen (außer direkt personenbezogen)
 - Sachverhalte und Strukturen
 
-Antworte NUR mit:
-1. Dem anonymisierten Text
-2. Darunter einer Mapping-Tabelle: Original → Platzhalter
+Antworte NUR als valides JSON in genau diesem Format:
+{
+  "anonymized_text": "vollstaendig anonymisierter Text",
+  "mapping": [
+    {"original": "Max Mustermann", "placeholder": "[NAME_A]"}
+  ]
+}
 
-Keine zusätzlichen Erklärungen.\
+Keine Markdown-Tabelle, keine zusätzlichen Erklärungen.\
 """
 
 
-def call_ollama(text: str) -> str:
+def _mapping_to_text(mapping: list[dict[str, str]]) -> str:
+    if not mapping:
+        return ""
+    lines = ["| Original | Platzhalter |", "|---|---|"]
+    for item in mapping:
+        original = item.get("original", "").replace("\n", " ").strip()
+        placeholder = item.get("placeholder", "").replace("\n", " ").strip()
+        if original and placeholder:
+            lines.append(f"| {original} | {placeholder} |")
+    return "\n".join(lines)
+
+
+def _extract_json_object(raw_response: str) -> dict[str, Any]:
+    raw_response = raw_response.strip()
+    try:
+        data = json.loads(raw_response)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", raw_response, flags=re.DOTALL)
+    if not match:
+        raise ValueError("Modellantwort ist kein valides JSON-Objekt")
+
+    data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("Modellantwort enthaelt kein JSON-Objekt")
+    return data
+
+
+def _normalize_ollama_response(raw_response: str) -> tuple[str, list[dict[str, str]]]:
+    data = _extract_json_object(raw_response)
+    anonymized_text = data.get("anonymized_text", "")
+    if not isinstance(anonymized_text, str) or not anonymized_text.strip():
+        raise ValueError("JSON-Antwort enthaelt keinen anonymisierten Text")
+
+    raw_mapping = data.get("mapping", [])
+    mapping: list[dict[str, str]] = []
+    if isinstance(raw_mapping, list):
+        for item in raw_mapping:
+            if not isinstance(item, dict):
+                continue
+            original = item.get("original")
+            placeholder = item.get("placeholder")
+            if isinstance(original, str) and isinstance(placeholder, str) and original.strip() and placeholder.strip():
+                mapping.append({
+                    "original": original.strip(),
+                    "placeholder": placeholder.strip(),
+                })
+
+    return anonymized_text.strip(), mapping
+
+
+def call_ollama(text: str) -> tuple[str, list[dict[str, str]]]:
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "stream": False,
@@ -72,7 +132,7 @@ def call_ollama(text: str) -> str:
     )
     with urllib.request.urlopen(req, timeout=600) as resp:  # 10 Min Timeout für lange Texte
         data = json.loads(resp.read())
-    return data["message"]["content"]
+    return _normalize_ollama_response(data["message"]["content"])
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
@@ -85,12 +145,37 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n\n--- Seite ---\n\n".join(pages)
 
 
-def split_mapping(full_response: str) -> tuple[str, str]:
-    """Trennt anonymisierten Text von der Mapping-Tabelle."""
-    parts = re.split(r"\n\n(?=\|)", full_response, maxsplit=1)
-    anon_text = parts[0].strip()
-    mapping = parts[1].strip() if len(parts) > 1 else ""
-    return anon_text, mapping
+def chunk_text(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for block in re.split(r"(\n\n--- Seite ---\n\n|\n\n)", text):
+        if not block:
+            continue
+        if len(block) > max_chars:
+            for i in range(0, len(block), max_chars):
+                part = block[i:i + max_chars]
+                if current:
+                    chunks.append("".join(current).strip())
+                    current = []
+                    current_len = 0
+                chunks.append(part.strip())
+            continue
+        if current_len + len(block) > max_chars and current:
+            chunks.append("".join(current).strip())
+            current = []
+            current_len = 0
+        current.append(block)
+        current_len += len(block)
+
+    if current:
+        chunks.append("".join(current).strip())
+
+    return [chunk for chunk in chunks if chunk]
 
 
 def _ascii_safe(text: str) -> str:
@@ -129,8 +214,8 @@ def build_pdf(anon_text: str, mapping: str) -> bytes:
         for wline in wrapped:
             pdf.cell(0, 6, wline, ln=True)
 
-    # Mapping-Tabelle
-    if mapping:
+    # Mapping-Tabelle ist standardmaessig deaktiviert, damit die PDF anonym bleibt.
+    if mapping and INCLUDE_MAPPING_IN_PDF:
         pdf.ln(6)
         pdf.set_font("Helvetica", "B", 11)
         pdf.cell(0, 8, "Mapping-Tabelle (Original -> Platzhalter)", ln=True)
@@ -164,20 +249,25 @@ def anonymize_pdf():
     if not raw_text.strip():
         return jsonify({"error": "Kein Text in der PDF gefunden (evtl. gescannt?)"}), 422
 
-    # Auf MAX_CHARS kürzen falls nötig
-    if len(raw_text) > MAX_CHARS:
-        app.logger.warning("Text zu lang (%d Zeichen) – wird auf %d gekürzt", len(raw_text), MAX_CHARS)
-        raw_text = raw_text[:MAX_CHARS] + "\n\n[... Text gekürzt ...]"
-
     app.logger.info("Text extrahiert: %d Zeichen", len(raw_text))
+
+    chunks = chunk_text(raw_text, MAX_CHARS)
+    app.logger.info("Verarbeite %d Chunk(s) mit max. %d Zeichen", len(chunks), MAX_CHARS)
 
     # Ollama anonymisieren
     try:
-        response = call_ollama(raw_text)
+        anonymized_chunks = []
+        combined_mapping: list[dict[str, str]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            app.logger.info("Anonymisiere Chunk %d/%d", index, len(chunks))
+            anon_text, mapping_entries = call_ollama(chunk)
+            anonymized_chunks.append(anon_text)
+            combined_mapping.extend(mapping_entries)
     except Exception as e:
         return jsonify({"error": f"Ollama-Fehler: {e}"}), 502
 
-    anon_text, mapping = split_mapping(response)
+    anon_text = "\n\n".join(anonymized_chunks)
+    mapping = _mapping_to_text(combined_mapping)
     app.logger.info("Anonymisiert: %d Zeichen", len(anon_text))
 
     # PDF generieren
@@ -205,15 +295,16 @@ def anonymize_text():
 
     text = data["text"][:MAX_CHARS]
     try:
-        response = call_ollama(text)
+        anon_text, mapping_entries = call_ollama(text)
     except Exception as e:
         return jsonify({"error": f"Ollama-Fehler: {e}"}), 502
 
-    anon_text, mapping = split_mapping(response)
+    mapping = _mapping_to_text(mapping_entries)
     return jsonify({
         "success": True,
         "anonymized_text": anon_text,
         "mapping_table": mapping,
+        "mapping_entries": mapping_entries,
         "original_length": len(data["text"]),
         "anonymized_length": len(anon_text),
     })

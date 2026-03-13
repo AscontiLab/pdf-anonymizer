@@ -20,7 +20,7 @@ from fpdf import FPDF
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://172.28.0.20:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # 7b: ~2x schneller auf CPU, für Anonymisierung ausreichend
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))  # Reduziert für schnellere Verarbeitung (~5-8 Min statt 24)
 

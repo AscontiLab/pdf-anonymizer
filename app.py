@@ -19,7 +19,15 @@ from flask import Flask, jsonify, request, send_file
 from fpdf import FPDF
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB Upload-Limit
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# API-Token für Zugriffskontrolle (Pflicht, außer /health)
+ANONYMIZER_API_TOKEN = os.environ.get("ANONYMIZER_API_TOKEN") or None
+if ANONYMIZER_API_TOKEN:
+    app.logger.info("ANONYMIZER_API_TOKEN konfiguriert — Endpoints geschützt")
+else:
+    app.logger.warning("WARNUNG: Kein ANONYMIZER_API_TOKEN gesetzt — Endpoints ungeschützt!")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # 7b: ~2x schneller auf CPU, für Anonymisierung ausreichend
@@ -228,8 +236,22 @@ def build_pdf(anon_text: str, mapping: str) -> bytes:
     return pdf.output()
 
 
+def _check_auth():
+    """Prüft Bearer-Token. Gibt None zurück wenn OK, sonst eine JSON-Response."""
+    if not ANONYMIZER_API_TOKEN:
+        return None
+    import hmac
+    auth = request.headers.get("Authorization", "")
+    if hmac.compare_digest(auth, f"Bearer {ANONYMIZER_API_TOKEN}"):
+        return None
+    return jsonify({"error": "Unauthorized"}), 401
+
+
 @app.route("/anonymize", methods=["POST"])
 def anonymize_pdf():
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
     if "file" not in request.files:
         return jsonify({"error": "Kein 'file' im Request (multipart/form-data erwartet)"}), 400
 
@@ -289,6 +311,9 @@ def anonymize_pdf():
 
 @app.route("/anonymize-text", methods=["POST"])
 def anonymize_text():
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
     data = request.get_json(silent=True)
     if not data or not data.get("text"):
         return jsonify({"error": "Kein 'text' im JSON-Body"}), 400

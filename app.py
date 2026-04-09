@@ -30,7 +30,7 @@ else:
     app.logger.warning("WARNUNG: Kein ANONYMIZER_API_TOKEN gesetzt — Endpoints ungeschützt!")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # 7b: ~2x schneller auf CPU, für Anonymisierung ausreichend
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")  # Gemma 4 E4B: DSGVO-konform, lokal via Ollama
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))
 INCLUDE_MAPPING_IN_PDF = os.environ.get("INCLUDE_MAPPING_IN_PDF", "").lower() in {"1", "true", "yes"}
 

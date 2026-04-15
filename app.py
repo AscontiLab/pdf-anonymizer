@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import textwrap
 import urllib.request
 from datetime import datetime
@@ -157,14 +159,54 @@ def call_ollama(text: str, existing_mapping: list[dict[str, str]] | None = None)
     return _normalize_ollama_response(data["message"]["content"])
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
+def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, bool]:
+    """Extrahiert Text aus PDF. Fallback auf OCR bei gescannten Dokumenten.
+    Gibt (text, used_ocr) zurueck."""
     pages = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
                 pages.append(t)
-    return "\n\n--- Seite ---\n\n".join(pages)
+
+    if pages:
+        return "\n\n--- Seite ---\n\n".join(pages), False
+
+    # Fallback: OCR mit ocrmypdf + tesseract (deutsch + englisch)
+    app.logger.info("Kein Text gefunden — starte OCR-Erkennung...")
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_in:
+        tmp_in.write(pdf_bytes)
+        tmp_in_path = tmp_in.name
+
+    tmp_out_path = tmp_in_path.replace(".pdf", "_ocr.pdf")
+    try:
+        subprocess.run(
+            ["ocrmypdf", "--force-ocr", "-l", "deu+eng", "--skip-big", "50",
+             "--jobs", "2", tmp_in_path, tmp_out_path],
+            capture_output=True, text=True, timeout=300, check=True,
+        )
+        ocr_pages = []
+        with pdfplumber.open(tmp_out_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    ocr_pages.append(t)
+        if ocr_pages:
+            app.logger.info("OCR erfolgreich: %d Seiten erkannt", len(ocr_pages))
+            return "\n\n--- Seite ---\n\n".join(ocr_pages), True
+        return "", True
+    except subprocess.TimeoutExpired:
+        app.logger.error("OCR-Timeout nach 5 Minuten")
+        return "", True
+    except subprocess.CalledProcessError as e:
+        app.logger.error("OCR fehlgeschlagen: %s", e.stderr)
+        return "", True
+    finally:
+        for p in (tmp_in_path, tmp_out_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -276,16 +318,16 @@ def anonymize_pdf():
     pdf_bytes = f.read()
     app.logger.info("PDF empfangen: %s (%d Bytes)", f.filename, len(pdf_bytes))
 
-    # Text extrahieren
+    # Text extrahieren (mit OCR-Fallback fuer gescannte PDFs)
     try:
-        raw_text = extract_pdf_text(pdf_bytes)
+        raw_text, used_ocr = extract_pdf_text(pdf_bytes)
     except Exception as e:
         return jsonify({"error": f"PDF-Textextraktion fehlgeschlagen: {e}"}), 500
 
     if not raw_text.strip():
-        return jsonify({"error": "Kein Text in der PDF gefunden (evtl. gescannt?)"}), 422
+        return jsonify({"error": "Kein Text in der PDF gefunden — auch OCR konnte keinen Text erkennen"}), 422
 
-    app.logger.info("Text extrahiert: %d Zeichen", len(raw_text))
+    app.logger.info("Text extrahiert: %d Zeichen%s", len(raw_text), " (via OCR)" if used_ocr else "")
 
     chunks = chunk_text(raw_text, MAX_CHARS)
     app.logger.info("Verarbeite %d Chunk(s) mit max. %d Zeichen", len(chunks), MAX_CHARS)

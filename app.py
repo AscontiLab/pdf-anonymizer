@@ -5,6 +5,7 @@ POST /anonymize  — nimmt eine PDF, gibt anonymisierte PDF zurück
 POST /anonymize-text — nimmt JSON {text}, gibt anonymisierten Text zurück (wie bisher)
 """
 
+import hashlib
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import os
 import re
 import textwrap
 import urllib.request
+from datetime import datetime
 from typing import Any
 
 import pdfplumber
@@ -121,14 +123,26 @@ def _normalize_ollama_response(raw_response: str) -> tuple[str, list[dict[str, s
     return anonymized_text.strip(), mapping
 
 
-def call_ollama(text: str) -> tuple[str, list[dict[str, str]]]:
+def call_ollama(text: str, existing_mapping: list[dict[str, str]] | None = None) -> tuple[str, list[dict[str, str]]]:
+    # Kontext aus vorherigen Chunks mitgeben fuer konsistente Platzhalter
+    mapping_context = ""
+    if existing_mapping:
+        mapping_lines = ", ".join(
+            f'"{m["original"]}" -> {m["placeholder"]}' for m in existing_mapping
+        )
+        mapping_context = (
+            f"\n\nWICHTIG: Verwende exakt dieselben Platzhalter fuer bereits bekannte Entitaeten:\n"
+            f"{mapping_lines}\n"
+            f"Neue Entitaeten bekommen den naechsten freien Buchstaben/Nummer."
+        )
+
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "stream": False,
         "keep_alive": "10m",  # Modell bleibt warm für Folgeanfragen
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Anonymisiere folgenden Text DSGVO-konform:\n\n{text}"},
+            {"role": "user", "content": f"Anonymisiere folgenden Text DSGVO-konform:{mapping_context}\n\n{text}"},
         ],
     }).encode()
 
@@ -207,7 +221,7 @@ def build_pdf(anon_text: str, mapping: str) -> bytes:
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, "DSGVO-anonymisiertes Dokument", ln=True)
     pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 6, "Erstellt mit DSGVO Anonymizer (Ollama / qwen2.5:7b)", ln=True)
+    pdf.cell(0, 6, "Erstellt mit DSGVO Anonymizer (Ollama / Gemma 4)", ln=True)
     pdf.cell(0, 6, "Hinweis: Umlaute wurden fuer PDF-Kompatibilitaet ersetzt (ae/oe/ue)", ln=True)
     pdf.ln(4)
 
@@ -276,27 +290,56 @@ def anonymize_pdf():
     chunks = chunk_text(raw_text, MAX_CHARS)
     app.logger.info("Verarbeite %d Chunk(s) mit max. %d Zeichen", len(chunks), MAX_CHARS)
 
-    # Ollama anonymisieren
+    # Ollama anonymisieren — mit Mapping-Kontext fuer chunk-uebergreifende Konsistenz
     try:
         anonymized_chunks = []
         combined_mapping: list[dict[str, str]] = []
         for index, chunk in enumerate(chunks, start=1):
-            app.logger.info("Anonymisiere Chunk %d/%d", index, len(chunks))
-            anon_text, mapping_entries = call_ollama(chunk)
+            app.logger.info("Anonymisiere Chunk %d/%d (%d bekannte Mappings)", index, len(chunks), len(combined_mapping))
+            anon_text, mapping_entries = call_ollama(chunk, existing_mapping=combined_mapping or None)
             anonymized_chunks.append(anon_text)
-            combined_mapping.extend(mapping_entries)
+            # Nur neue Mappings hinzufuegen (Duplikate vermeiden)
+            known_originals = {m["original"] for m in combined_mapping}
+            for entry in mapping_entries:
+                if entry["original"] not in known_originals:
+                    combined_mapping.append(entry)
+                    known_originals.add(entry["original"])
     except Exception as e:
         return jsonify({"error": f"Ollama-Fehler: {e}"}), 502
 
     anon_text = "\n\n".join(anonymized_chunks)
+
+    # Deterministisches Post-Processing: Alle bekannten Originale nochmal ersetzen
+    # (faengt Faelle ab, in denen das LLM ein Original uebersehen hat)
+    for entry in combined_mapping:
+        anon_text = anon_text.replace(entry["original"], entry["placeholder"])
+
     mapping = _mapping_to_text(combined_mapping)
-    app.logger.info("Anonymisiert: %d Zeichen", len(anon_text))
+    app.logger.info("Anonymisiert: %d Zeichen, %d Mappings", len(anon_text), len(combined_mapping))
 
     # PDF generieren
     try:
         pdf_out = build_pdf(anon_text, mapping)
     except Exception as e:
         return jsonify({"error": f"PDF-Generierung fehlgeschlagen: {e}"}), 500
+
+    # Mapping als JSON speichern (fuer spaetere De-Anonymisierung)
+    mapping_json_path = None
+    if combined_mapping:
+        mapping_dir = os.environ.get("MAPPING_DIR", "/tmp/anonymizer_mappings")
+        os.makedirs(mapping_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()[:8]
+        mapping_json_path = os.path.join(mapping_dir, f"mapping_{ts}_{file_hash}.json")
+        mapping_data = {
+            "source_file": f.filename,
+            "timestamp": ts,
+            "model": OLLAMA_MODEL,
+            "mapping": combined_mapping,
+        }
+        with open(mapping_json_path, "w", encoding="utf-8") as mf:
+            json.dump(mapping_data, mf, ensure_ascii=False, indent=2)
+        app.logger.info("Mapping gespeichert: %s (%d Eintraege)", mapping_json_path, len(combined_mapping))
 
     stem = os.path.splitext(f.filename)[0]
     out_name = f"{stem}_anonymisiert.pdf"
@@ -318,19 +361,34 @@ def anonymize_text():
     if not data or not data.get("text"):
         return jsonify({"error": "Kein 'text' im JSON-Body"}), 400
 
-    text = data["text"][:MAX_CHARS]
+    raw_text = data["text"]
+    chunks = chunk_text(raw_text, MAX_CHARS)
     try:
-        anon_text, mapping_entries = call_ollama(text)
+        anonymized_chunks = []
+        combined_mapping: list[dict[str, str]] = []
+        for chunk in chunks:
+            anon_chunk, mapping_entries = call_ollama(chunk, existing_mapping=combined_mapping or None)
+            anonymized_chunks.append(anon_chunk)
+            known_originals = {m["original"] for m in combined_mapping}
+            for entry in mapping_entries:
+                if entry["original"] not in known_originals:
+                    combined_mapping.append(entry)
+                    known_originals.add(entry["original"])
     except Exception as e:
         return jsonify({"error": f"Ollama-Fehler: {e}"}), 502
 
-    mapping = _mapping_to_text(mapping_entries)
+    anon_text = "\n\n".join(anonymized_chunks)
+    # Deterministisches Post-Processing
+    for entry in combined_mapping:
+        anon_text = anon_text.replace(entry["original"], entry["placeholder"])
+
+    mapping = _mapping_to_text(combined_mapping)
     return jsonify({
         "success": True,
         "anonymized_text": anon_text,
         "mapping_table": mapping,
-        "mapping_entries": mapping_entries,
-        "original_length": len(data["text"]),
+        "mapping_entries": combined_mapping,
+        "original_length": len(raw_text),
         "anonymized_length": len(anon_text),
     })
 

@@ -1,0 +1,28 @@
+[Unit]
+Description=DSGVO PDF-Anonymizer
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/pdf_anonymizer
+Environment=OLLAMA_URL=http://172.28.0.20:11434
+Environment=OLLAMA_MODEL=gemma4:e4b
+Environment=MAX_CHARS=8000
+Environment=PORT=5050
+Environment=MAPPING_DIR=/var/lib/anonymizer/mappings
+Environment=MAPPING_RETENTION_DAYS=30
+EnvironmentFile=/etc/pdf-anonymizer.env
+ExecStart=/usr/bin/python3 /root/pdf_anonymizer/app.py
+Restart=always
+RestartSec=5
+# PII-Hardening
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/pdf_anonymizer/logs /var/lib/anonymizer
+NoNewPrivileges=true
+StandardOutput=append:/root/pdf_anonymizer/logs/anonymizer.log
+StandardError=append:/root/pdf_anonymizer/logs/anonymizer.log
+
+[Install]
+WantedBy=multi-user.target

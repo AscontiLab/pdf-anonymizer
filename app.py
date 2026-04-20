@@ -26,17 +26,46 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB Upload-Limit
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# API-Token für Zugriffskontrolle (Pflicht, außer /health)
+# API-Token für Zugriffskontrolle (Pflicht, außer /health).
+# Ohne Token läuft der Dienst nur im ALLOW_NO_TOKEN-Modus (explizites Opt-in, nur fuer lokale Tests).
 ANONYMIZER_API_TOKEN = os.environ.get("ANONYMIZER_API_TOKEN") or None
+ALLOW_NO_TOKEN = os.environ.get("ANONYMIZER_ALLOW_NO_TOKEN", "").lower() in {"1", "true", "yes"}
 if ANONYMIZER_API_TOKEN:
+    if len(ANONYMIZER_API_TOKEN) < 24:
+        raise RuntimeError("ANONYMIZER_API_TOKEN zu kurz (mind. 24 Zeichen erforderlich)")
     app.logger.info("ANONYMIZER_API_TOKEN konfiguriert — Endpoints geschützt")
+elif ALLOW_NO_TOKEN:
+    app.logger.warning("WARNUNG: ALLOW_NO_TOKEN=1 — Endpoints ungeschuetzt, nur fuer lokale Tests!")
 else:
-    app.logger.warning("WARNUNG: Kein ANONYMIZER_API_TOKEN gesetzt — Endpoints ungeschützt!")
+    raise RuntimeError(
+        "ANONYMIZER_API_TOKEN nicht gesetzt. Setze ihn via Environment "
+        "oder starte bewusst mit ANONYMIZER_ALLOW_NO_TOKEN=1 (nur lokal)."
+    )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")  # Gemma 4 E4B: DSGVO-konform, lokal via Ollama
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")  # Qwen 2.5 7B: schnell, passt in 16GB RAM
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "8000"))
 INCLUDE_MAPPING_IN_PDF = os.environ.get("INCLUDE_MAPPING_IN_PDF", "").lower() in {"1", "true", "yes"}
+MAPPING_RETENTION_DAYS = int(os.environ.get("MAPPING_RETENTION_DAYS", "30"))
+
+
+def _cleanup_old_mappings(directory: str, retention_days: int) -> None:
+    """Loescht Mapping-JSONs aelter als retention_days. Laeuft lazy bei jedem Anonymize-Call."""
+    if retention_days <= 0:
+        return
+    cutoff = datetime.now().timestamp() - retention_days * 86400
+    try:
+        for entry in os.listdir(directory):
+            if not entry.startswith("mapping_") or not entry.endswith(".json"):
+                continue
+            path = os.path.join(directory, entry)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 SYSTEM_PROMPT = """\
 Du bist ein DSGVO-Anonymisierungs-Assistent. Anonymisiere personenbezogene Daten \
@@ -295,7 +324,9 @@ def build_pdf(anon_text: str, mapping: str) -> bytes:
 def _check_auth():
     """Prüft Bearer-Token. Gibt None zurück wenn OK, sonst eine JSON-Response."""
     if not ANONYMIZER_API_TOKEN:
-        return None
+        if ALLOW_NO_TOKEN:
+            return None
+        return jsonify({"error": "Service not configured (no token)"}), 503
     import hmac
     auth = request.headers.get("Authorization", "")
     if hmac.compare_digest(auth, f"Bearer {ANONYMIZER_API_TOKEN}"):
@@ -365,11 +396,17 @@ def anonymize_pdf():
     except Exception as e:
         return jsonify({"error": f"PDF-Generierung fehlgeschlagen: {e}"}), 500
 
-    # Mapping als JSON speichern (fuer spaetere De-Anonymisierung)
+    # Mapping als JSON speichern (fuer spaetere De-Anonymisierung).
+    # Default-Pfad ist /var/lib/anonymizer/mappings mit chmod 700 — enthaelt PII!
     mapping_json_path = None
     if combined_mapping:
-        mapping_dir = os.environ.get("MAPPING_DIR", "/tmp/anonymizer_mappings")
+        mapping_dir = os.environ.get("MAPPING_DIR", "/var/lib/anonymizer/mappings")
         os.makedirs(mapping_dir, exist_ok=True)
+        try:
+            os.chmod(mapping_dir, 0o700)
+        except PermissionError:
+            app.logger.warning("Konnte Berechtigung auf %s nicht auf 700 setzen", mapping_dir)
+        _cleanup_old_mappings(mapping_dir, retention_days=MAPPING_RETENTION_DAYS)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_hash = hashlib.sha256(pdf_bytes).hexdigest()[:8]
         mapping_json_path = os.path.join(mapping_dir, f"mapping_{ts}_{file_hash}.json")
@@ -381,6 +418,7 @@ def anonymize_pdf():
         }
         with open(mapping_json_path, "w", encoding="utf-8") as mf:
             json.dump(mapping_data, mf, ensure_ascii=False, indent=2)
+        os.chmod(mapping_json_path, 0o600)
         app.logger.info("Mapping gespeichert: %s (%d Eintraege)", mapping_json_path, len(combined_mapping))
 
     stem = os.path.splitext(f.filename)[0]
